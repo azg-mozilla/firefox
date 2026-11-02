@@ -12,9 +12,20 @@ export class AgentMonitorItemChild extends JSWindowActorChild {
    * @param {CustomEvent} event
    */
   async handleEvent(event) {
-    if (event.type !== "agent-monitor-item:resolve-titles") {
-      return;
+    switch (event.type) {
+      case "agent-monitor-item:resolve-titles":
+        await this.#resolveTitles(event);
+        break;
+      case "agent-monitor-item:request-suggestion":
+        await this.#requestSuggestion(event);
+        break;
     }
+  }
+
+  /**
+   * @param {CustomEvent} event
+   */
+  async #resolveTitles(event) {
     // event.target is retargeted to the page's outermost shadow host, so take the
     // card from the path, which is only available while the event is dispatching
     const card = event.composedPath()[0];
@@ -35,6 +46,39 @@ export class AgentMonitorItemChild extends JSWindowActorChild {
       );
     } catch (error) {
       console.warn("AgentMonitorItemChild: could not resolve titles", error);
+    }
+  }
+
+  /**
+   * @param {CustomEvent} event
+   */
+  async #requestSuggestion(event) {
+    const card = event.composedPath()[0];
+    const { requestId, watchUrls, condition, includeCondition } =
+      event.detail ?? {};
+    if (!card) {
+      return;
+    }
+
+    try {
+      const suggestion = await this.sendQuery("AgentMonitorItem:Suggest", {
+        watchUrls: Array.from(watchUrls ?? []),
+        condition: String(condition ?? ""),
+        includeCondition: !!includeCondition,
+      });
+      if (!suggestion) {
+        return;
+      }
+      card.dispatchEvent(
+        new this.contentWindow.CustomEvent("agent-monitor-item:suggestion", {
+          detail: Cu.cloneInto(
+            { requestId, ...suggestion },
+            this.contentWindow
+          ),
+        })
+      );
+    } catch (error) {
+      console.warn("AgentMonitorItemChild: could not get a suggestion", error);
     }
   }
 }

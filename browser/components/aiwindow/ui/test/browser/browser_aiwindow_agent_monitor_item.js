@@ -1724,3 +1724,328 @@ add_task(async function test_resume_disabled_without_room() {
     });
   });
 });
+
+const SUGGESTION_PAGE = "https://example.com/trail-runner";
+
+add_task(async function test_create_form_fills_untouched_fields() {
+  await withTestPage(async browser => {
+    await SpecialPowers.spawn(browser, [SUGGESTION_PAGE], async page => {
+      const el = content.document.getElementById("test-agent-monitor-item");
+      const requests = [];
+      let draft;
+      el.addEventListener("agent-monitor-item:request-suggestion", e =>
+        requests.push({ ...e.detail, watchUrls: [...e.detail.watchUrls] })
+      );
+      el.addEventListener(
+        "agent-monitor-item:draft-change",
+        e => (draft = e.detail?.draft)
+      );
+      el.agent = Cu.cloneInto({ watchUrls: [page] }, content);
+      el.mode = "create";
+      await el.updateComplete;
+
+      Assert.equal(
+        requests.length,
+        1,
+        "Opening the form on a page asks for a suggestion"
+      );
+      Assert.deepEqual(
+        requests[0].watchUrls,
+        [page],
+        "The request names the page the form was opened on"
+      );
+      Assert.equal(requests[0].condition, "", "There is no condition yet");
+      Assert.ok(
+        requests[0].includeCondition,
+        "A condition is asked for while the user has none"
+      );
+
+      el.dispatchEvent(
+        new content.CustomEvent("agent-monitor-item:suggestion", {
+          detail: Cu.cloneInto(
+            {
+              requestId: requests[0].requestId,
+              title: "Trail Runner 2 price",
+              condition: "The price drops below $129.99",
+            },
+            content
+          ),
+        })
+      );
+      await el.updateComplete;
+
+      Assert.equal(
+        el.shadowRoot.querySelector(".monitor-name-input").value,
+        "Trail Runner 2 price",
+        "The suggested name fills the empty name"
+      );
+      Assert.equal(
+        el.shadowRoot.querySelector(".monitor-condition-input").value,
+        "The price drops below $129.99",
+        "The suggested condition fills the empty condition"
+      );
+      Assert.equal(
+        draft?.monitorName,
+        "Trail Runner 2 price",
+        "The filled form reaches the host's draft"
+      );
+      Assert.ok(
+        !draft.nameEdited && !draft.conditionEdited,
+        "The draft remembers the fields were suggested, not typed"
+      );
+    });
+  });
+});
+
+add_task(async function test_suggestion_never_overwrites_typing() {
+  await withTestPage(async browser => {
+    await SpecialPowers.spawn(browser, [SUGGESTION_PAGE], async page => {
+      const el = content.document.getElementById("test-agent-monitor-item");
+      const requests = [];
+      el.addEventListener("agent-monitor-item:request-suggestion", e =>
+        requests.push(e.detail.requestId)
+      );
+      el.agent = Cu.cloneInto({ watchUrls: [page] }, content);
+      el.mode = "create";
+      await el.updateComplete;
+
+      const name = el.shadowRoot.querySelector(".monitor-name-input");
+      const condition = el.shadowRoot.querySelector(".monitor-condition-input");
+      name.value = "My running shoes";
+      name.dispatchEvent(new content.Event("input", { bubbles: true }));
+      condition.value = "they go on sale";
+      condition.dispatchEvent(new content.Event("input", { bubbles: true }));
+
+      el.dispatchEvent(
+        new content.CustomEvent("agent-monitor-item:suggestion", {
+          detail: Cu.cloneInto(
+            {
+              requestId: requests[0],
+              title: "Trail Runner 2 price",
+              condition: "The price drops below $129.99",
+            },
+            content
+          ),
+        })
+      );
+      await el.updateComplete;
+
+      Assert.equal(
+        name.value,
+        "My running shoes",
+        "A suggestion arriving late leaves the typed name alone"
+      );
+      Assert.equal(
+        condition.value,
+        "they go on sale",
+        "and the typed condition"
+      );
+    });
+  });
+});
+
+add_task(async function test_edits_refresh_the_suggested_name() {
+  await withTestPage(async browser => {
+    await SpecialPowers.spawn(browser, [SUGGESTION_PAGE], async page => {
+      const el = content.document.getElementById("test-agent-monitor-item");
+      const requests = [];
+      el.addEventListener("agent-monitor-item:request-suggestion", e =>
+        requests.push({ ...e.detail })
+      );
+      const answer = (requestId, suggestion) =>
+        el.dispatchEvent(
+          new content.CustomEvent("agent-monitor-item:suggestion", {
+            detail: Cu.cloneInto({ requestId, ...suggestion }, content),
+          })
+        );
+      el.agent = Cu.cloneInto({ watchUrls: [page] }, content);
+      el.mode = "create";
+      await el.updateComplete;
+
+      const name = el.shadowRoot.querySelector(".monitor-name-input");
+      const condition = el.shadowRoot.querySelector(".monitor-condition-input");
+      const first = requests[0].requestId;
+      answer(first, {
+        title: "Trail Runner 2 price",
+        condition: "The price drops below $129.99",
+      });
+      await el.updateComplete;
+
+      condition.value = "Size 10 is back in stock";
+      condition.dispatchEvent(new content.Event("input", { bubbles: true }));
+      await ContentTaskUtils.waitForCondition(
+        () => requests.length === 2,
+        "Editing the condition asks for a name that matches it"
+      );
+      Assert.equal(
+        requests[1].condition,
+        "Size 10 is back in stock",
+        "The request carries the edited condition"
+      );
+      Assert.ok(
+        !requests[1].includeCondition,
+        "The condition the user wrote is not asked about"
+      );
+
+      answer(first, { title: "Stale name", condition: "" });
+      await el.updateComplete;
+      Assert.equal(
+        name.value,
+        "Trail Runner 2 price",
+        "An answer to an older request is dropped"
+      );
+
+      answer(requests[1].requestId, {
+        title: "Trail Runner 2 size 10 restock",
+        condition: "",
+      });
+      await el.updateComplete;
+      Assert.equal(
+        name.value,
+        "Trail Runner 2 size 10 restock",
+        "The suggested name follows the edit"
+      );
+      Assert.equal(
+        condition.value,
+        "Size 10 is back in stock",
+        "The edited condition stays"
+      );
+
+      name.value = "Shoes";
+      name.dispatchEvent(new content.Event("input", { bubbles: true }));
+      condition.value = "Size 11 is back in stock";
+      condition.dispatchEvent(new content.Event("input", { bubbles: true }));
+      // Long enough for an edit to ask again, had it needed to.
+      // eslint-disable-next-line mozilla/no-arbitrary-setTimeout
+      await new Promise(resolve => content.setTimeout(resolve, 1500));
+      Assert.equal(
+        requests.length,
+        2,
+        "Once the user names the task, edits stop asking for a name"
+      );
+    });
+  });
+});
+
+add_task(async function test_restored_form_keeps_its_suggested_name() {
+  await withTestPage(async browser => {
+    await SpecialPowers.spawn(browser, [SUGGESTION_PAGE], async page => {
+      const el = content.document.getElementById("test-agent-monitor-item");
+      const requests = [];
+      el.addEventListener("agent-monitor-item:request-suggestion", e =>
+        requests.push({ ...e.detail })
+      );
+      el.draft = Cu.cloneInto(
+        {
+          monitorName: "Trail Runner 2 price",
+          condition: "The price drops below $129.99",
+          watchUrls: [page],
+          nameEdited: false,
+          conditionEdited: false,
+        },
+        content
+      );
+      el.agent = Cu.cloneInto({ watchUrls: [page] }, content);
+      el.mode = "create";
+      await el.updateComplete;
+
+      const name = el.shadowRoot.querySelector(".monitor-name-input");
+      Assert.equal(
+        requests.length,
+        0,
+        "A form restored with its name and condition doesn't ask again"
+      );
+      Assert.equal(name.value, "Trail Runner 2 price", "The name is restored");
+
+      el.pendingUrl = "https://example.com/trail-runner-3";
+      await el.updateComplete;
+      el.shadowRoot.querySelector(".add-page-btn").click();
+      await ContentTaskUtils.waitForCondition(
+        () => requests.length === 1,
+        "Adding a page asks for a name that matches the pages"
+      );
+      el.dispatchEvent(
+        new content.CustomEvent("agent-monitor-item:suggestion", {
+          detail: Cu.cloneInto(
+            {
+              requestId: requests[0].requestId,
+              title: "Trail Runner shoes price",
+              condition: "",
+            },
+            content
+          ),
+        })
+      );
+      await el.updateComplete;
+      Assert.equal(
+        name.value,
+        "Trail Runner shoes price",
+        "A suggested name restored from a draft still follows edits"
+      );
+    });
+  });
+});
+
+add_task(async function test_older_draft_keeps_its_typed_name() {
+  await withTestPage(async browser => {
+    await SpecialPowers.spawn(browser, [SUGGESTION_PAGE], async page => {
+      const el = content.document.getElementById("test-agent-monitor-item");
+      const requests = [];
+      el.addEventListener("agent-monitor-item:request-suggestion", e =>
+        requests.push({ ...e.detail })
+      );
+      // Drafts saved before suggestions carry no flags, only what was typed.
+      el.draft = Cu.cloneInto(
+        { monitorName: "My running shoes", condition: "", watchUrls: [page] },
+        content
+      );
+      el.agent = Cu.cloneInto({ watchUrls: [page] }, content);
+      el.mode = "create";
+      await el.updateComplete;
+
+      Assert.equal(requests.length, 1, "The empty condition is asked about");
+      el.dispatchEvent(
+        new content.CustomEvent("agent-monitor-item:suggestion", {
+          detail: Cu.cloneInto(
+            {
+              requestId: requests[0].requestId,
+              title: "Trail Runner 2 price",
+              condition: "The price drops below $129.99",
+            },
+            content
+          ),
+        })
+      );
+      await el.updateComplete;
+      Assert.equal(
+        el.shadowRoot.querySelector(".monitor-name-input").value,
+        "My running shoes",
+        "A name restored from an older draft is treated as typed"
+      );
+      Assert.equal(
+        el.shadowRoot.querySelector(".monitor-condition-input").value,
+        "The price drops below $129.99",
+        "The empty condition still takes the suggestion"
+      );
+    });
+  });
+});
+
+add_task(async function test_editing_a_monitor_asks_for_nothing() {
+  await withTestPage(async browser => {
+    await SpecialPowers.spawn(browser, [AGENT], async agent => {
+      const el = content.document.getElementById("test-agent-monitor-item");
+      let requests = 0;
+      el.addEventListener(
+        "agent-monitor-item:request-suggestion",
+        () => requests++
+      );
+      el.agent = Cu.cloneInto({ ...agent, monitorName: "" }, content);
+      el.mode = "display";
+      el.expanded = true;
+      el.editing = true;
+      await el.updateComplete;
+      Assert.equal(requests, 0, "Only the create form asks for suggestions");
+    });
+  });
+});

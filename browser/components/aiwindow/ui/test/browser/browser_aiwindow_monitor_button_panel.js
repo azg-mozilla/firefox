@@ -23,6 +23,10 @@ const { MonitorPanel } = ChromeUtils.importESModule(
   "moz-src:///browser/components/aiwindow/ui/modules/MonitorPanel.sys.mjs"
 );
 
+const { MonitorUIUtils } = ChromeUtils.importESModule(
+  "moz-src:///browser/components/aiwindow/ui/modules/MonitorUIUtils.sys.mjs"
+);
+
 const { SpecialMessageActions } = ChromeUtils.importESModule(
   "resource://messaging-system/lib/SpecialMessageActions.sys.mjs"
 );
@@ -1273,6 +1277,66 @@ add_task(async function test_monitor_panel_header_follows_view() {
       title.textContent,
       "Tasks",
       "Header follows the cancelled view back"
+    );
+
+    const hidden = BrowserTestUtils.waitForEvent(panel, "popuphidden");
+    panel.hidePopup();
+    await hidden;
+  } finally {
+    sb.restore();
+    await BrowserTestUtils.closeWindow(win);
+  }
+});
+
+add_task(async function test_monitor_panel_create_view_fills_suggestion() {
+  const sb = this.sinon.createSandbox();
+  sb.stub(MonitorAgent, "listMonitors").resolves([]);
+  const suggest = sb.stub(MonitorUIUtils, "suggestMonitorSetup").resolves({
+    title: "Example Domain updates",
+    condition: "A new section is added to the page",
+  });
+  const win = await openAIWindow();
+  try {
+    await promiseNavigateAndLoad(
+      win.gBrowser.selectedBrowser,
+      "https://example.com/"
+    );
+
+    const shown = BrowserTestUtils.waitForEvent(
+      win.document.getElementById("mainPopupSet"),
+      "popupshown"
+    );
+    AIWindowUI.showMonitorCreateForm(win);
+    const panel = (await shown).target;
+    const contents = panel.querySelector("agent-monitor-panel");
+    await TestUtils.waitForCondition(() => contents.view === "create");
+    await contents.updateComplete;
+    const form = contents.shadowRoot.querySelector("agent-monitor-item");
+
+    await TestUtils.waitForCondition(
+      () =>
+        form.shadowRoot.querySelector(".monitor-name-input")?.value ===
+        "Example Domain updates",
+      "The panel answers the form's request with a suggested name"
+    );
+    Assert.deepEqual(
+      suggest.firstCall.args[0],
+      {
+        watchUrls: ["https://example.com/"],
+        condition: "",
+        includeCondition: true,
+      },
+      "The suggestion is grounded in the page the panel was opened on"
+    );
+    Assert.equal(
+      form.shadowRoot.querySelector(".monitor-condition-input").value,
+      "A new section is added to the page",
+      "The suggested condition fills the empty condition"
+    );
+    Assert.equal(
+      contents.draft?.monitorName,
+      "Example Domain updates",
+      "The panel holds the filled form in its draft"
     );
 
     const hidden = BrowserTestUtils.waitForEvent(panel, "popuphidden");

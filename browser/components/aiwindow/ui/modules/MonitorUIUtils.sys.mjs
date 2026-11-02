@@ -5,9 +5,15 @@
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   BrowserWindowTracker: "resource:///modules/BrowserWindowTracker.sys.mjs",
+  isAllowedWatchUrl:
+    "moz-src:///browser/components/aiwindow/models/agents/Monitor.sys.mjs",
   MonitorAgent:
     "moz-src:///browser/components/aiwindow/models/agents/MonitorAgent.sys.mjs",
+  MonitorSetup:
+    "moz-src:///browser/components/aiwindow/models/agents/MonitorSetup.sys.mjs",
   PlacesUtils: "resource://gre/modules/PlacesUtils.sys.mjs",
+  TOTAL_NUM_URLS_IN_MONITOR:
+    "moz-src:///browser/components/aiwindow/models/agents/Monitor.sys.mjs",
   Region: "resource://gre/modules/Region.sys.mjs",
   URILoadingHelper: "resource:///modules/URILoadingHelper.sys.mjs",
 });
@@ -320,6 +326,59 @@ export const MonitorUIUtils = {
       );
     } catch (error) {
       console.warn("Could not answer watch URL title request", error);
+    }
+  },
+
+  /**
+   * Suggests a name for a monitor being created and, when asked, a condition
+   * to watch for, grounded in the pages, their titles and the user's other
+   * monitors.
+   *
+   * @param {object} request - See agent-monitor-item:request-suggestion
+   * @param {string[]} request.watchUrls
+   * @param {string} [request.condition] - What the user wrote so far
+   * @param {boolean} [request.includeCondition]
+   * @returns {Promise<?{title: string, condition: string}>} null when there is
+   *   nothing to suggest
+   */
+  async suggestMonitorSetup({ watchUrls, condition, includeCondition }) {
+    const urls = (Array.isArray(watchUrls) ? watchUrls : [])
+      .filter(url => typeof url === "string" && lazy.isAllowedWatchUrl(url))
+      .slice(0, lazy.TOTAL_NUM_URLS_IN_MONITOR);
+    const [pageTitles, monitors] = await Promise.all([
+      this.resolveWatchUrlTitles(urls),
+      lazy.MonitorAgent.listMonitors().catch(() => []),
+    ]);
+    return lazy.MonitorSetup.suggest({
+      watchUrls: urls,
+      pageTitles,
+      condition: typeof condition === "string" ? condition : "",
+      includeCondition: !!includeCondition,
+      existingTitles: monitors.map(monitor => monitor.title),
+    });
+  },
+
+  /**
+   * Answers an agent-monitor-item:request-suggestion from a card hosted in
+   * chrome. Content hosts are answered by AgentMonitorItemChild instead.
+   *
+   * @param {CustomEvent} event - The request, still being dispatched
+   */
+  async answerSuggestionRequest(event) {
+    const card = event.composedPath()[0];
+    const { requestId, ...request } = event.detail ?? {};
+    try {
+      const suggestion = await this.suggestMonitorSetup(request);
+      if (!suggestion) {
+        return;
+      }
+      card?.dispatchEvent(
+        new card.documentGlobal.CustomEvent("agent-monitor-item:suggestion", {
+          detail: { requestId, ...suggestion },
+        })
+      );
+    } catch (error) {
+      console.warn("Could not answer monitor suggestion request", error);
     }
   },
 

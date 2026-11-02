@@ -26,6 +26,13 @@ export class AgentMonitorItemParent extends JSWindowActorParent {
         .slice(0, lazy.TOTAL_NUM_URLS_IN_MONITOR);
       return lazy.MonitorUIUtils.resolveWatchUrlTitles(urls);
     }
+    if (name === "AgentMonitorItem:Suggest") {
+      return lazy.MonitorUIUtils.suggestMonitorSetup({
+        watchUrls: Array.isArray(data?.watchUrls) ? data.watchUrls : [],
+        condition: typeof data?.condition === "string" ? data.condition : "",
+        includeCondition: !!data?.includeCondition,
+      });
+    }
     console.warn(`AgentMonitorItemParent received unknown message: ${name}`);
     return undefined;
   }

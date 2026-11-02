@@ -590,6 +590,71 @@ add_task(async function test_create_card_chip_shows_open_tab_title() {
   }
 });
 
+add_task(async function test_create_card_gets_a_suggested_name() {
+  const { MonitorUIUtils } = ChromeUtils.importESModule(
+    "moz-src:///browser/components/aiwindow/ui/modules/MonitorUIUtils.sys.mjs"
+  );
+  const suggest = sinon.stub(MonitorUIUtils, "suggestMonitorSetup").resolves({
+    title: "Example product price",
+    condition: "",
+  });
+  const restoreSignIn = skipSignIn();
+  const { restore } = await stubEngineNetworkBoundaries({
+    serverOptions: { streamChunks: ["Set up a monitor for this page."] },
+  });
+  const win = await openAIWindow();
+
+  try {
+    const aichatBrowser = await getAichatBrowser(win.gBrowser.selectedBrowser);
+    await setupConversationWithToolUI(aichatBrowser, {
+      ...MONITOR_CARD,
+      toolUIData: {
+        ...MONITOR_CARD.toolUIData,
+        properties: {
+          agent: {
+            ...MONITOR_CARD.toolUIData.properties.agent,
+            monitorName: "",
+          },
+        },
+      },
+    });
+
+    await SpecialPowers.spawn(aichatBrowser, [], async () => {
+      const chatContent = content.document.querySelector("ai-chat-content");
+      const card = await ContentTaskUtils.waitForCondition(
+        () => chatContent.shadowRoot.querySelector("agent-monitor-item"),
+        "Wait for agent-monitor-item"
+      );
+      const fieldValue = selector =>
+        card.shadowRoot.querySelector(selector)?.wrappedJSObject.value;
+      await ContentTaskUtils.waitForCondition(
+        () => fieldValue(".monitor-name-input") === "Example product price",
+        "The suggested name reaches the card in chat through its actor"
+      );
+      Assert.equal(
+        fieldValue(".monitor-condition-input"),
+        "the price drops",
+        "The condition the chat seeded is left alone"
+      );
+    });
+
+    Assert.deepEqual(
+      suggest.firstCall.args[0],
+      {
+        watchUrls: ["https://example.com/product"],
+        condition: "the price drops",
+        includeCondition: false,
+      },
+      "Only a name is asked for when the chat already has a condition"
+    );
+  } finally {
+    await BrowserTestUtils.closeWindow(win);
+    restoreSignIn();
+    await restore();
+    suggest.restore();
+  }
+});
+
 // The sidebar's chat header lives in chrome and floats over the chat document,
 // so a dropdown placed against the top of the viewport is painted over and the
 // header's buttons take the clicks meant for its first row (bug 2073461).

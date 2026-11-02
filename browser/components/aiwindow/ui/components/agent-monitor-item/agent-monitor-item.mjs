@@ -54,6 +54,10 @@ const DEFAULT_MAX_WATCH_URLS = 5;
 // How long to coalesce typing before mirroring the form to the host
 const DRAFT_PERSIST_DELAY_MS = 250;
 
+// How long the create form waits after an edit before asking for a task name
+// that matches it
+const SUGGESTION_DELAY_MS = 1000;
+
 // Check times offered by the create card in 30-minute increments
 const TIME_OPTIONS = Array.from({ length: 48 }, (_, i) => {
   const hour24 = Math.floor(i / 2);
@@ -128,6 +132,12 @@ const WEEKDAYS = [
  *  - agent-monitor-item:resolve-titles detail: { urls } - Asks for the page
  *    titles of form pages that have none. Whoever answers dispatches
  *    agent-monitor-item:titles-resolved, detail: { titles }, on this card.
+ *  - agent-monitor-item:request-suggestion detail: { requestId, watchUrls,
+ *    condition, includeCondition } - Asks the create form for a task name
+ *    and, with includeCondition, a condition to watch for. Whoever answers
+ *    dispatches agent-monitor-item:suggestion, detail: { requestId, title,
+ *    condition }, on this card, which only fills fields the user has not
+ *    typed in.
  *  - agent-monitor-item:cancel
  *  - agent-monitor-item:delete       detail: { id }
  *  - agent-monitor-item:pause        detail: { id, paused }
@@ -162,6 +172,8 @@ const WEEKDAYS = [
  *    watchUrls?: string[],
  *    pendingUrl?: string,
  *    schedule?: { frequency: string, time: string, weekday: number },
+ *    nameEdited?: boolean,     // the user typed the name rather than taking
+ *    conditionEdited?: boolean, // a suggestion, so suggestions leave it alone
  *  }
  * @property {"display"|"create"} mode - Which card layout to render
  * @property {boolean} expanded - Whether the display card is expanded
@@ -227,11 +239,20 @@ export class AgentMonitorItem extends MozLitElement {
     this.addEventListener("agent-monitor-item:titles-resolved", event => {
       this.resolvedTitles = { ...this.resolvedTitles, ...event.detail?.titles };
     });
+    this.addEventListener("agent-monitor-item:suggestion", event =>
+      this.#applySuggestion(event.detail)
+    );
   }
 
   #draftName;
   #draftPersistTimer = null;
   #requestedTitleUrls = new Set();
+  #nameEdited = false;
+  #conditionEdited = false;
+  #initialSuggestionPending = false;
+  #suggestionTimer = null;
+  #suggestionRequest = null;
+  #suggestionRequestCount = 0;
 
   willUpdate(changed) {
     if (changed.has("agent")) {
@@ -250,6 +271,118 @@ export class AgentMonitorItem extends MozLitElement {
       changed.has("editing")
     ) {
       this.#requestMissingTitles();
+    }
+    if (this.#initialSuggestionPending) {
+      this.#initialSuggestionPending = false;
+      this.#requestSuggestion({ initial: true });
+    }
+  }
+
+  /**
+   * Asks the host for a task name, and for a condition while the user has not
+   * written one.
+   *
+   * @param {object} [options]
+   * @param {boolean} [options.initial] - The form just opened, so a name it
+   *   already has (from a restored draft) is kept rather than replaced.
+   */
+  #requestSuggestion({ initial = false } = {}) {
+    this.#clearSuggestionTimer();
+    if (this.mode !== "create") {
+      return;
+    }
+    const condition = this.alertDescription.trim();
+    const includeCondition = !this.#conditionEdited && !condition;
+    const wantsName =
+      !this.#nameEdited && !(initial && this.#monitorName.trim());
+    if (!(wantsName || includeCondition)) {
+      return;
+    }
+    if (!this.pageUrls.length && !condition) {
+      return;
+    }
+    this.#suggestionRequest = {
+      id: ++this.#suggestionRequestCount,
+      includeCondition,
+    };
+    this.#dispatch("agent-monitor-item:request-suggestion", {
+      requestId: this.#suggestionRequest.id,
+      watchUrls: [...this.pageUrls],
+      condition,
+      includeCondition,
+    });
+  }
+
+  // An edit to the condition or the pages can make the name stale, so ask
+  // again once the user pauses.
+  #scheduleSuggestion() {
+    if (this.mode !== "create") {
+      return;
+    }
+    this.#clearSuggestionTimer();
+    this.#suggestionTimer = setTimeout(
+      () => this.#requestSuggestion(),
+      SUGGESTION_DELAY_MS
+    );
+  }
+
+  #clearSuggestionTimer() {
+    if (this.#suggestionTimer) {
+      clearTimeout(this.#suggestionTimer);
+      this.#suggestionTimer = null;
+    }
+  }
+
+  /**
+   * Fills the fields the user has not typed in from the answer to the latest
+   * request. Answers to older requests are stale and dropped.
+   *
+   * @param {object} [suggestion]
+   * @param {number} suggestion.requestId
+   * @param {string} [suggestion.title]
+   * @param {string} [suggestion.condition]
+   */
+  async #applySuggestion({ requestId, title, condition } = {}) {
+    const request = this.#suggestionRequest;
+    if (this.mode !== "create" || !request || requestId !== request.id) {
+      return;
+    }
+    let nameFilled = false;
+    if (title && !this.#nameEdited && title !== this.#monitorName) {
+      this.#draftName = title;
+      this.#clearFieldError("name");
+      nameFilled = true;
+    }
+    let conditionFilled = false;
+    if (
+      condition &&
+      request.includeCondition &&
+      !this.#conditionEdited &&
+      !this.alertDescription.trim()
+    ) {
+      this.alertDescription = condition;
+      this.#clearFieldError("condition");
+      conditionFilled = true;
+    }
+    if (!nameFilled && !conditionFilled) {
+      return;
+    }
+    this.requestUpdate();
+    this.#persistDraft();
+
+    // Typing into a name the user is looking at replaces the suggestion rather
+    // than appending to it.
+    const nameInput = this.shadowRoot?.querySelector(".monitor-name-input");
+    if (
+      nameFilled &&
+      nameInput &&
+      this.shadowRoot.activeElement === nameInput
+    ) {
+      await this.updateComplete;
+      await nameInput.updateComplete;
+      if (this.shadowRoot.activeElement === nameInput && !this.#nameEdited) {
+        nameInput.select();
+      }
     }
   }
 
@@ -275,12 +408,18 @@ export class AgentMonitorItem extends MozLitElement {
     if (this.#draftPersistTimer) {
       this.#flushDraft();
     }
+    this.#clearSuggestionTimer();
     super.disconnectedCallback();
   }
 
   #seedFromAgent() {
     this.#draftName = null;
     this.#requestedTitleUrls.clear();
+    this.#nameEdited = false;
+    this.#conditionEdited = false;
+    this.#clearSuggestionTimer();
+    this.#suggestionRequest = null;
+    this.#initialSuggestionPending = true;
 
     const { watchUrls, url, condition, expanded } = this.agent ?? {};
     let seededUrls = [];
@@ -319,8 +458,16 @@ export class AgentMonitorItem extends MozLitElement {
     if (!this.draft) {
       return;
     }
-    const { editing, monitorName, condition, watchUrls, pendingUrl, schedule } =
-      this.draft;
+    const {
+      editing,
+      monitorName,
+      condition,
+      watchUrls,
+      pendingUrl,
+      schedule,
+      nameEdited,
+      conditionEdited,
+    } = this.draft;
 
     // A draft only outlives the card while an edit is unsubmitted, so reopen
     // the form the user was in the middle of. The edit affordances live in the
@@ -349,6 +496,15 @@ export class AgentMonitorItem extends MozLitElement {
     }
     if (schedule?.weekday !== undefined) {
       this.scheduleWeekday = Number(schedule.weekday);
+    }
+    if (nameEdited !== undefined) {
+      this.#nameEdited = !!nameEdited;
+    } else if (monitorName?.trim()) {
+      // A draft from before suggestions only has names the user typed.
+      this.#nameEdited = true;
+    }
+    if (conditionEdited !== undefined) {
+      this.#conditionEdited = !!conditionEdited;
     }
   }
 
@@ -387,6 +543,8 @@ export class AgentMonitorItem extends MozLitElement {
           time: this.scheduleTime,
           weekday: this.scheduleWeekday,
         },
+        nameEdited: this.#nameEdited,
+        conditionEdited: this.#conditionEdited,
       },
     });
   }
@@ -482,6 +640,8 @@ export class AgentMonitorItem extends MozLitElement {
 
   #onNameInput(event) {
     this.#draftName = event.target.value;
+    // Clearing the name hands it back to the suggestions.
+    this.#nameEdited = !!this.#draftName.trim();
     this.#clearFieldError("name");
     // Typing coalesces, a change (blur) flushes right away
     this.#persistDraft({ debounce: event.type === "input" });
@@ -513,14 +673,18 @@ export class AgentMonitorItem extends MozLitElement {
 
   #onConditionInput(event) {
     this.alertDescription = event.target.value;
+    this.#conditionEdited = true;
     this.#clearFieldError("condition");
     this.#persistDraft({ debounce: event.type === "input" });
+    this.#scheduleSuggestion();
   }
 
   #onPresetClick(preset) {
     this.alertDescription = preset;
+    this.#conditionEdited = true;
     this.#clearFieldError("condition");
     this.#persistDraft();
+    this.#scheduleSuggestion();
   }
 
   // Normalize a user-entered address to a watchable http(s) URL. A value with
@@ -591,6 +755,7 @@ export class AgentMonitorItem extends MozLitElement {
     this.pendingUrlError = null;
     this.#clearFieldError("pages");
     this.#persistDraft();
+    this.#scheduleSuggestion();
   }
 
   async #handleAddUrl() {
@@ -605,6 +770,7 @@ export class AgentMonitorItem extends MozLitElement {
   #removeUrl(url) {
     this.pageUrls = this.pageUrls.filter(u => u !== url);
     this.#persistDraft();
+    this.#scheduleSuggestion();
   }
 
   #displayUrl(url) {
@@ -635,6 +801,8 @@ export class AgentMonitorItem extends MozLitElement {
     // Cancelling drops the whole card, and with it the draft the host holds,
     // so this only has to stop a coalesced edit from landing after that
     this.#clearDraftTimer();
+    this.#clearSuggestionTimer();
+    this.#suggestionRequest = null;
     this.#dispatch("agent-monitor-item:cancel", {});
   }
 
@@ -648,6 +816,8 @@ export class AgentMonitorItem extends MozLitElement {
     // The host drops the draft as it commits the form, so make sure a coalesced
     // edit can't land after that and resurrect it
     this.#clearDraftTimer();
+    this.#clearSuggestionTimer();
+    this.#suggestionRequest = null;
     const isCreateMode = this.mode === "create";
     this.#dispatch("agent-monitor-item:submit", {
       mode: this.mode,
